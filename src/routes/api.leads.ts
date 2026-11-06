@@ -1,7 +1,5 @@
 import { createFileRoute } from '@tanstack/react-router'
 import { z } from 'zod'
-import { db } from '../../db'
-import { leads } from '../../db/schema'
 
 const leadInput = z.object({
   name: z.string().trim().min(2).max(120),
@@ -13,26 +11,35 @@ const leadInput = z.object({
   website: z.string().max(0).optional(),
 })
 
-// Destino externo que recebe cada cadastro (nome e número do cliente).
-const LEAD_WEBHOOK_URL =
-  process.env.LEAD_WEBHOOK_URL ?? 'https://qualimixcrm.lovable.app/funil'
+// Integração servidor-a-servidor. O CRM mantém a fila internamente;
+// nenhum banco de dados é exigido na landing page.
+const CRM_LEADS_WEBHOOK_URL =
+  process.env.CRM_LEADS_WEBHOOK_URL ??
+  'https://qualimixcrm.lovable.app/api/webhooks/leads'
 
 async function forwardLead(nome: string, numero: string) {
-  try {
-    const response = await fetch(LEAD_WEBHOOK_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ nome_cliente: nome, numero_cliente: numero }),
-      signal: AbortSignal.timeout(8000),
-    })
-    if (!response.ok) {
-      console.error(
-        `Envio do cadastro ao destino externo falhou: HTTP ${response.status}`,
-      )
-    }
-  } catch (error) {
-    console.error('Falha ao enviar cadastro ao destino externo', error)
+  const response = await fetch(CRM_LEADS_WEBHOOK_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify({
+      nome_cliente: nome,
+      numero_cliente: numero,
+    }),
+    signal: AbortSignal.timeout(10000),
+  })
+
+  const result = (await response.json().catch(() => null)) as
+    | { ok?: boolean; message?: string }
+    | null
+
+  if (!response.ok || result?.ok !== true) {
+    throw new Error(
+      result?.message ??
+        `O CRM não confirmou o recebimento do lead (HTTP ${response.status}).`,
+    )
   }
+
+  return result
 }
 
 export const Route = createFileRoute('/api/leads')({
@@ -54,19 +61,29 @@ export const Route = createFileRoute('/api/leads')({
           )
         }
 
+        // Sem banco local: só confirma o cadastro depois que o servidor do CRM
+        // responder que recebeu os dados para a fila interna do funil.
         try {
-          const [lead] = await db
-            .insert(leads)
-            .values({ name: parsed.data.name, phone: parsed.data.phone })
-            .returning({ id: leads.id })
-          // O cadastro já está salvo; uma falha no envio externo não bloqueia o cliente.
-          await forwardLead(parsed.data.name, parsed.data.phone)
-          return Response.json({ ok: true, id: lead.id }, { status: 201 })
-        } catch (error) {
-          console.error('Falha ao salvar cadastro de cliente', error)
+          const result = await forwardLead(
+            parsed.data.name,
+            parsed.data.phone,
+          )
           return Response.json(
-            { error: 'Não foi possível concluir seu cadastro agora.' },
-            { status: 500 },
+            {
+              ok: true,
+              message: 'Cadastro enviado ao CRM com sucesso.',
+              crmMessage: result.message,
+            },
+            { status: 201 },
+          )
+        } catch (error) {
+          console.error('Falha ao encaminhar cadastro ao CRM', error)
+          return Response.json(
+            {
+              error:
+                'Não conseguimos entregar seu cadastro ao CRM agora. Tente novamente ou fale direto com a gente pelo WhatsApp.',
+            },
+            { status: 502 },
           )
         }
       },
